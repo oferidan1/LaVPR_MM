@@ -176,19 +176,10 @@ def main(args):
     logger.info(f"The outputs are being saved in {log_dir}")
 
     IMAGENET_MEAN_STD = {'mean': [0.485, 0.456, 0.406], 'std': [0.229, 0.224, 0.225]}
-    BLIP_MEAN_STD = {'mean': [0.48145466, 0.4578275, 0.40821073], 'std': [0.26862954, 0.26130258, 0.27577711]}
-    SIGLIP_MEAN_STD = {'mean': [0.5, 0.5, 0.5], 'std': [0.5, 0.5, 0.5]}
-
     dataset_mean_std = IMAGENET_MEAN_STD
-    if 'blip' in args.vpr_model_name.lower() or 'clip' in args.vpr_model_name.lower() or 'eva' in args.vpr_model_name.lower():
-        dataset_mean_std = BLIP_MEAN_STD
-    elif 'siglip' in args.vpr_model_name.lower():
-        dataset_mean_std = SIGLIP_MEAN_STD
-
+    
     model = LaVPR_wrapper(args)
     logger.info(f"VLM encoder dim: {model.encoder_dim}")
-    
-
 
     is_msls_challenge = False
     if 'msls_challenge' in args.image_root:        
