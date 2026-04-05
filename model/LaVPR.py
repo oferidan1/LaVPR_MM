@@ -52,6 +52,10 @@ class LaVPR(pl.LightningModule):
                 is_image_pooling=False,
                 is_orig_desc_mining=False,
                 text_encoder_dim=1024,
+                #----- Differentiable Rank Integration
+                use_dri=False,
+                dri_tau=0.1,
+                dri_k=60.0,
                  ):
         super().__init__()
         
@@ -80,9 +84,15 @@ class LaVPR(pl.LightningModule):
         self.is_image_pooling = is_image_pooling
         self.is_orig_desc_mining = is_orig_desc_mining
         
+        self.dri_k = dri_k
+        
         self.save_hyperparameters() # write hyperparams into a file
         
-        self.loss_fn = utils.get_loss(loss_name)
+        dri = None
+        if use_dri:
+            from utils.rank_integration import DifferentiableRankIntegration
+            dri = DifferentiableRankIntegration(tau=dri_tau, k=dri_k)
+        self.loss_fn = utils.get_loss(loss_name, dri=dri)
         self.miner = utils.get_miner(miner_name, miner_margin)
         self.batch_acc = [] # we will keep track of the % of trivial pairs/triplets at the loss level 
        
@@ -416,11 +426,29 @@ class LaVPR(pl.LightningModule):
                                                     w_q=q_w_list,
                                                     k_values=[1, 5, 10, 15, 20, 50, 100],
                                                     gt=positives,
+                                                    rrf_k=self.dri_k,
                                                     print_results=True,
                                                     dataset_name=val_set_name,
                                                     faiss_gpu=self.faiss_gpu
                                                 )
-                
+
+                # --- Log alpha distribution (w_v = alpha, w_l = 1 - alpha) ---
+                if w_feats is not None and w_feats.ndim == 2:
+                    alpha_all = w_feats[:, 0]
+                    alpha_q = q_w_list[:, 0]
+                    alpha_r = r_w_list[:, 0]
+                    self.log(f'{val_set_name}/alpha_mean', alpha_all.mean().item(), prog_bar=False, logger=True)
+                    self.log(f'{val_set_name}/alpha_std', alpha_all.std().item(), prog_bar=False, logger=True)
+                    self.log(f'{val_set_name}/alpha_min', alpha_all.min().item(), prog_bar=False, logger=True)
+                    self.log(f'{val_set_name}/alpha_max', alpha_all.max().item(), prog_bar=False, logger=True)
+                    self.log(f'{val_set_name}/alpha_q_mean', alpha_q.mean().item(), prog_bar=False, logger=True)
+                    self.log(f'{val_set_name}/alpha_r_mean', alpha_r.mean().item(), prog_bar=False, logger=True)
+
+                    if hasattr(self.logger, 'experiment') and hasattr(self.logger.experiment, 'add_histogram'):
+                        self.logger.experiment.add_histogram(f'{val_set_name}/alpha_dist', alpha_all, self.current_epoch)
+                        self.logger.experiment.add_histogram(f'{val_set_name}/alpha_q_dist', alpha_q, self.current_epoch)
+                        self.logger.experiment.add_histogram(f'{val_set_name}/alpha_r_dist', alpha_r, self.current_epoch)
+
             else:
 
                 pitts_dict = utils.get_validation_recalls(r_list=r_list, 
@@ -576,5 +604,3 @@ class MeanReweightingPooler(nn.Module):
         if return_scores:
             return pooled, weights  # return per-token weights
         return pooled   
-    
-

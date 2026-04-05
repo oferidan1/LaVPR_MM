@@ -43,6 +43,9 @@ def parse_arguments():
     parser.add_argument("--is_val", type=int, default="1", help="run validation 0=no/1=yes")    
     parser.add_argument("--text_dim", type=int, default=1024, help="dimension of the text embeddings")
     parser.add_argument("--img_per_place", type=int, default=4, help="number of images per place")
+    parser.add_argument("--use_dri", type=int, default=0, help="enable Differentiable Rank Integration (0=off, 1=on)")
+    parser.add_argument("--dri_tau", type=float, default=0.1, help="temperature for soft-rank sigmoid in DRI")
+    parser.add_argument("--dri_k", type=float, default=60.0, help="smoothing constant for reciprocal-rank fusion in DRI")
     args = parser.parse_args()
     
     return args            
@@ -119,6 +122,9 @@ if __name__ == '__main__':
         is_text_pooling=args.is_text_pooling,
         is_image_pooling=args.is_image_pooling,        
         text_encoder_dim=args.text_dim,
+        use_dri=args.use_dri,
+        dri_tau=args.dri_tau,
+        dri_k=args.dri_k,
     )
     
     # if args.is_encode_image and  args.vpr_resume_model is not None:

@@ -104,6 +104,13 @@ def parse_arguments():
     parser.add_argument("--max_rerank", type=int, default="100", help="max_rerank")    
     parser.add_argument("--bfloat16", type=int, default="0", help="bfloat16 or not")    
 
+    # W-RRF inference options
+    parser.add_argument("--use_wrrf", type=int, default=0, help="use Weighted-RRF fusion at inference (1=on)")
+    parser.add_argument("--rrf_k", type=float, default=60.0, help="k constant for W-RRF")
+
+    # Output directory
+    parser.add_argument("--output_dir", type=str, default=None,
+                        help="explicit output directory; defaults to logs/<log_dir>/<timestamp>")
 
     args = parser.parse_args()
     

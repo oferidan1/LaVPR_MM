@@ -30,6 +30,7 @@ import kornia.feature as KF
 from PIL import Image
 from transformers import AutoModelForCausalLM, AutoProcessor
 import re
+from utils.validation import rerank_predictions_rrf
 
 
 def rerank_predictions_by_text_or_image(vision_scores, vision_predictions, text_scores, text_predictions, max_results):
@@ -166,7 +167,11 @@ def main(args):
     start_time = datetime.now()
 
     logger.remove()  # Remove possibly previously existing loggers
-    log_dir = Path("logs") / args.log_dir / start_time.strftime("%Y-%m-%d_%H-%M-%S")
+    if args.output_dir:
+        log_dir = Path(args.output_dir)
+    else:
+        log_dir = Path("logs") / args.log_dir / start_time.strftime("%Y-%m-%d_%H-%M-%S")
+    log_dir.mkdir(parents=True, exist_ok=True)
     logger.add(sys.stdout, colorize=True, format="<green>{time:%Y-%m-%d %H:%M:%S}</green> {message}", level="INFO")
     logger.add(log_dir / "info.log", format="<green>{time:%Y-%m-%d %H:%M:%S}</green> {message}", level="INFO")
     logger.add(log_dir / "debug.log", level="DEBUG")
@@ -244,10 +249,47 @@ def main(args):
                 model.encoder_dim = all_descriptors.shape[1]
                 logger.info(f"Concatenated descriptors dimension: {model.encoder_dim}")
    
+    # ── Log per-query vision weights ──────────────────────────────────
+    query_w_alpha = w_alpha[test_ds.num_database:]
+    weights_csv = log_dir / "per_query_weights.csv"
+    query_paths = test_ds.images_paths[test_ds.num_database:]
+    weight_rows = []
+    for i, (w_v, w_t) in enumerate(query_w_alpha):
+        weight_rows.append({"query_idx": i, "query_path": query_paths[i],
+                            "w_vision": float(w_v), "w_text": float(w_t)})
+    pd.DataFrame(weight_rows).to_csv(weights_csv, index=False)
+    logger.info(f"Per-query weights saved to {weights_csv}")
+    logger.info(f"Query w_vision — mean: {query_w_alpha[:, 0].mean():.4f}, "
+                f"std: {query_w_alpha[:, 0].std():.4f}, "
+                f"min: {query_w_alpha[:, 0].min():.4f}, "
+                f"max: {query_w_alpha[:, 0].max():.4f}")
+
     alpha = args.alpha_vision
     max_results_reranking = test_ds.num_database            
-        
-    if (args.is_dual_encoder and args.dual_encoder_fusion=='each') or args.fusion_type=='dynamic_weighting' or args.fusion_type=='fixed_weighting' or args.fusion_type=='text_adapter' or args.fusion_type=='transformer' or args.rerank_by_text_or_image:         
+
+    # ── W-RRF inference path ──────────────────────────────────────────
+    if args.use_wrrf:
+        logger.info(f"Using W-RRF fusion (rrf_k={args.rrf_k})")
+        vision_queries_descriptors = vision_descriptors[test_ds.num_database:]
+        vision_database_descriptors = vision_descriptors[:test_ds.num_database]
+        text_queries_descriptors = text_descriptors[test_ds.num_database:]
+        text_database_descriptors = text_descriptors[:test_ds.num_database]
+
+        vision_scores, vision_predictions = get_queries_predictions(
+            model.vpr_encoder_dim, vision_database_descriptors,
+            vision_descriptors, vision_queries_descriptors, max_results_reranking)
+        text_scores, text_predictions = get_queries_predictions(
+            model.text_encoder_dim, text_database_descriptors,
+            text_descriptors, text_queries_descriptors, max_results_reranking)
+
+        w_r = w_alpha[:test_ds.num_database]
+        w_q = w_alpha[test_ds.num_database:]
+        predictions = rerank_predictions_rrf(
+            vision_predictions, text_predictions, w_r, w_q,
+            rrf_k=args.rrf_k, max_results=max(args.recall_values))
+        scores = None
+
+    elif (args.is_dual_encoder and args.dual_encoder_fusion=='each') or args.fusion_type=='dynamic_weighting' or args.fusion_type=='fixed_weighting' or args.fusion_type=='text_adapter' or args.fusion_type=='transformer' or args.rerank_by_text_or_image:         
         
         # vision
         vision_queries_descriptors = vision_descriptors[test_ds.num_database :]

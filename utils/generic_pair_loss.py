@@ -6,8 +6,9 @@ from .base_metric_loss_function import BaseMetricLossFunction
 import torch.nn.functional as F
 
 class GenericPairLoss(BaseMetricLossFunction):
-    def __init__(self, mat_based_loss, **kwargs):
+    def __init__(self, mat_based_loss, dri=None, **kwargs):
         super().__init__(**kwargs)
+        self.dri = dri
         self.loss_method = (
             self.mat_based_loss if mat_based_loss else self.pair_based_loss
         )
@@ -58,7 +59,31 @@ class GenericPairLoss(BaseMetricLossFunction):
         if all(len(x) <= 1 for x in indices_tuple):
             return self.zero_losses()
         #mat = self.distance(embeddings, ref_emb)
-        
+
+        # --- DRI path: rank-based fusion ---
+        if (self.dri is not None
+                and w is not None
+                and len(w.shape) > 1
+                and embeds2 is not None):
+            img_sim = torch.matmul(embeddings, embeddings.T)
+            text_sim = torch.matmul(embeds2, embeds2.T)
+
+            w_i = w[:, 0].unsqueeze(1)
+            w_t = w[:, 1].unsqueeze(1)
+            w_v_ij = ((w_i.unsqueeze(1) + w_i.unsqueeze(0)) / 2.0).squeeze(-1)
+            w_l_ij = ((w_t.unsqueeze(1) + w_t.unsqueeze(0)) / 2.0).squeeze(-1)
+
+            B = labels.size(0)
+            label_eq = labels.unsqueeze(0) == labels.unsqueeze(1)
+            eye = torch.eye(B, dtype=torch.bool, device=labels.device)
+            pos_mask_full = label_eq & ~eye
+            neg_mask_full = ~label_eq
+
+            s_ij = self.dri(img_sim, text_sim, pos_mask_full, neg_mask_full,
+                            w_v_ij, w_l_ij)
+            return self.loss_method(s_ij, indices_tuple)
+
+        # --- Original paths (unchanged) ---
         # cross modal case
         if w is None:
             s_ij = torch.matmul(embeddings, embeds2.T)
