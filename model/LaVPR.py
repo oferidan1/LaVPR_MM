@@ -56,6 +56,7 @@ class LaVPR(pl.LightningModule):
                 use_dri=False,
                 dri_tau=0.1,
                 dri_k=60.0,
+                dri_dynamic_tau=False,
                  ):
         super().__init__()
         
@@ -91,7 +92,7 @@ class LaVPR(pl.LightningModule):
         dri = None
         if use_dri:
             from utils.rank_integration import DifferentiableRankIntegration
-            dri = DifferentiableRankIntegration(tau=dri_tau, k=dri_k)
+            dri = DifferentiableRankIntegration(tau=dri_tau, k=dri_k, dynamic_tau=bool(dri_dynamic_tau))
         self.loss_fn = utils.get_loss(loss_name, dri=dri)
         self.miner = utils.get_miner(miner_name, miner_margin)
         self.batch_acc = [] # we will keep track of the % of trivial pairs/triplets at the loss level 
@@ -279,6 +280,11 @@ class LaVPR(pl.LightningModule):
             miner_outputs = self.miner(descriptors, labels)     
             loss = self.loss_fn(descriptors, labels, miner_outputs, embeds2=text_embeds, w=w)            
             
+            dri = getattr(self.loss_fn, 'dri', None)
+            if dri is not None and hasattr(dri, 'last_tau_v'):
+                self.log('train/tau_vision', dri.last_tau_v.item(), logger=True)
+                self.log('train/tau_language', dri.last_tau_l.item(), logger=True)
+
             if w is not None:
                 if len(w.shape) > 1:
                     w_i = w[:,0].mean()

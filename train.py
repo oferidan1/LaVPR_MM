@@ -44,10 +44,21 @@ def parse_arguments():
     parser.add_argument("--text_dim", type=int, default=1024, help="dimension of the text embeddings")
     parser.add_argument("--img_per_place", type=int, default=4, help="number of images per place")
     parser.add_argument("--use_dri", type=int, default=0, help="enable Differentiable Rank Integration (0=off, 1=on)")
-    parser.add_argument("--dri_tau", type=float, default=0.1, help="temperature for soft-rank sigmoid in DRI")
+    parser.add_argument("--dri_tau", type=float, default=None, help="fixed temperature for soft-rank sigmoid in DRI (mutually exclusive with --dri_dynamic_tau)")
     parser.add_argument("--dri_k", type=float, default=60.0, help="smoothing constant for reciprocal-rank fusion in DRI")
+    parser.add_argument("--dri_dynamic_tau", type=int, default=0, help="use per-batch dynamic tau instead of fixed (0=fixed, 1=dynamic)")
     args = parser.parse_args()
-    
+
+    if args.use_dri:
+        if args.dri_dynamic_tau and args.dri_tau is not None:
+            parser.error("--dri_tau and --dri_dynamic_tau=1 are mutually exclusive. "
+                         "Dynamic mode computes tau from batch statistics.")
+        if not args.dri_dynamic_tau and args.dri_tau is None:
+            parser.error("--dri_tau is required when using fixed tau (--dri_dynamic_tau=0).")
+
+    if args.dri_tau is None:
+        args.dri_tau = 0.1
+
     return args            
             
 if __name__ == '__main__':    
@@ -125,6 +136,7 @@ if __name__ == '__main__':
         use_dri=args.use_dri,
         dri_tau=args.dri_tau,
         dri_k=args.dri_k,
+        dri_dynamic_tau=args.dri_dynamic_tau,
     )
     
     # if args.is_encode_image and  args.vpr_resume_model is not None:
