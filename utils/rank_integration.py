@@ -138,6 +138,11 @@ class DifferentiableRankIntegration(nn.Module):
             tau_l = torch.clamp(s_l.std(), min=0.01).detach()
             self.last_tau_v = tau_v
             self.last_tau_l = tau_l
+        elif hasattr(self, 'precomputed_tau_v'):
+            tau_v = self.precomputed_tau_v
+            tau_l = self.precomputed_tau_l
+            self.last_tau_v = tau_v
+            self.last_tau_l = tau_l
         else:
             tau_v = self.tau
             tau_l = self.tau

@@ -1,6 +1,7 @@
 import pytorch_lightning as pl
 import torch
 from pytorch_lightning.callbacks import Callback, ModelCheckpoint
+from pytorch_lightning.loggers import WandbLogger
 from torch.optim import lr_scheduler, optimizer
 import utils
 from torch import nn
@@ -12,6 +13,79 @@ import argparse
 from model.LaVPR import LaVPR
 
 
+def precompute_tau_from_data(model, datamodule, device, csv_dir):
+    """One pass over training data to compute per-modality tau from similarity std.
+
+    If CSV files from a prior run already exist in *csv_dir*, they are loaded
+    instead of re-running inference (saves time across repeated experiments).
+
+    Returns (tau_v, tau_l) — one float per modality.
+    """
+    import numpy as np
+    from pathlib import Path
+    from tqdm import tqdm
+
+    csv_dir = Path(csv_dir)
+    csv_dir.mkdir(parents=True, exist_ok=True)
+
+    img_csv_path = csv_dir / 'vision_similarities.csv'
+    text_csv_path = csv_dir / 'language_similarities.csv'
+
+    if img_csv_path.exists() and text_csv_path.exists():
+        print(f"[precomputed_tau] Loading cached similarities from {csv_dir}")
+        img_sims = np.loadtxt(img_csv_path, delimiter=',', skiprows=1)
+        text_sims = np.loadtxt(text_csv_path, delimiter=',', skiprows=1)
+        tau_v = max(float(np.std(img_sims)), 0.01)
+        tau_l = max(float(np.std(text_sims)), 0.01)
+        print(f"  Vision  — mean={np.mean(img_sims):.6f}  std={np.std(img_sims):.6f}  → tau_v={tau_v:.6f}")
+        print(f"  Language — mean={np.mean(text_sims):.6f}  std={np.std(text_sims):.6f}  → tau_l={tau_l:.6f}")
+        return tau_v, tau_l
+
+    print("[precomputed_tau] Computing per-modality similarity distributions over training data …")
+    model.eval()
+
+    train_loader = datamodule.train_dataloader()
+
+    all_img_sims = []
+    all_text_sims = []
+
+    with torch.no_grad():
+        for batch in tqdm(train_loader, desc="Precomputing similarities"):
+            places, labels, texts = batch
+            BS, N, ch, h, w = places.shape
+            images = places.view(BS * N, ch, h, w).to(device)
+
+            flat_texts = []
+            for i in range(BS):
+                for j in range(N):
+                    flat_texts.append(texts[j][i])
+
+            descriptors, text_embeds, _, _, _ = model(images, flat_texts)
+
+            img_sim = torch.matmul(descriptors, descriptors.T)
+            text_sim = torch.matmul(text_embeds, text_embeds.T)
+
+            triu_mask = torch.triu(torch.ones(img_sim.shape[0], img_sim.shape[1],
+                                              dtype=torch.bool, device=img_sim.device), diagonal=1)
+            all_img_sims.append(img_sim[triu_mask].cpu().float().numpy())
+            all_text_sims.append(text_sim[triu_mask].cpu().float().numpy())
+
+    all_img_sims = np.concatenate(all_img_sims)
+    all_text_sims = np.concatenate(all_text_sims)
+
+    np.savetxt(img_csv_path, all_img_sims, delimiter=',', header='similarity', comments='')
+    np.savetxt(text_csv_path, all_text_sims, delimiter=',', header='similarity', comments='')
+    print(f"[precomputed_tau] Saved {len(all_img_sims)} pairwise similarities per modality to {csv_dir}")
+
+    tau_v = max(float(np.std(all_img_sims)), 0.01)
+    tau_l = max(float(np.std(all_text_sims)), 0.01)
+    print(f"  Vision  — mean={np.mean(all_img_sims):.6f}  std={np.std(all_img_sims):.6f}  n={len(all_img_sims)}  → tau_v={tau_v:.6f}")
+    print(f"  Language — mean={np.mean(all_text_sims):.6f}  std={np.std(all_text_sims):.6f}  n={len(all_text_sims)}  → tau_l={tau_l:.6f}")
+
+    model.train()
+    return tau_v, tau_l
+
+
 def parse_arguments():
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     # Resume parameters
@@ -19,7 +93,8 @@ def parse_arguments():
     parser.add_argument("--vpr_model_name", type=str, default="mixvpr")
     parser.add_argument("--vpr_model_backbone", type=str, default="ResNet50")
     # Other parameters
-    parser.add_argument("--gpu", type=str, default='0', help="gpu id(s) to use")    
+    parser.add_argument("--gpu", type=str, default='0', help="gpu id(s) to use")
+    parser.add_argument("--device", type=str, default='cuda', help="device to train on (e.g. cuda, cuda:0, cpu)")    
     parser.add_argument("--epochs", type=int, default='10', help="number of epochs to train")    
     parser.add_argument("--train_csv", type=str, default="datasets/descriptions/gsv_cities_descriptions.csv")    
     parser.add_argument("--image_root", type=str, default="/mnt/d/data/gsv_cities/", help="root directory for images")
@@ -47,14 +122,17 @@ def parse_arguments():
     parser.add_argument("--dri_tau", type=float, default=None, help="fixed temperature for soft-rank sigmoid in DRI (mutually exclusive with --dri_dynamic_tau)")
     parser.add_argument("--dri_k", type=float, default=60.0, help="smoothing constant for reciprocal-rank fusion in DRI")
     parser.add_argument("--dri_dynamic_tau", type=int, default=0, help="use per-batch dynamic tau instead of fixed (0=fixed, 1=dynamic)")
+    parser.add_argument("--dri_precomputed_tau", type=int, default=0, help="compute tau per-modality from train-data similarity std before training (0=off, 1=on)")
+    parser.add_argument("--dri_sim_csv_dir", type=str, default=None, help="directory to save/load precomputed similarity CSVs (default: ./LOGS/sim_cache)")
+    parser.add_argument("--wandb_project", type=str, default=None, help="wandb project name to log to (disabled if not set)")
     args = parser.parse_args()
 
     if args.use_dri:
-        if args.dri_dynamic_tau and args.dri_tau is not None:
-            parser.error("--dri_tau and --dri_dynamic_tau=1 are mutually exclusive. "
-                         "Dynamic mode computes tau from batch statistics.")
-        if not args.dri_dynamic_tau and args.dri_tau is None:
-            parser.error("--dri_tau is required when using fixed tau (--dri_dynamic_tau=0).")
+        n_tau_strategies = sum([bool(args.dri_dynamic_tau), bool(args.dri_precomputed_tau), args.dri_tau is not None])
+        if n_tau_strategies > 1:
+            parser.error("--dri_tau, --dri_dynamic_tau, and --dri_precomputed_tau are mutually exclusive.")
+        if n_tau_strategies == 0:
+            parser.error("One of --dri_tau, --dri_dynamic_tau=1, or --dri_precomputed_tau=1 is required.")
 
     if args.dri_tau is None:
         args.dri_tau = 0.1
@@ -65,7 +143,12 @@ if __name__ == '__main__':
     pl.utilities.seed.seed_everything(seed=190223, workers=True)
     
     args = parse_arguments()
-    os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
+    if 'cuda' in args.device and ':' in args.device:
+        gpu_id = args.device.split(':')[1]
+        os.environ['CUDA_VISIBLE_DEVICES'] = gpu_id
+    else:
+        os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
+    args.device = 'cuda' if 'cuda' in args.device else args.device
     
     dataset_mean_std = IMAGENET_MEAN_STD
     image_size = args.image_size    
@@ -143,8 +226,17 @@ if __name__ == '__main__':
     #     model_state_dict = torch.load(args.vpr_resume_model)
     #     model.vpr_encoder.load_state_dict(model_state_dict)
         
-    model = model.to('cuda')
-    
+    model = model.to(args.device)
+
+    if args.use_dri and args.dri_precomputed_tau:
+        csv_dir = args.dri_sim_csv_dir or './LOGS/sim_cache'
+        tau_v, tau_l = precompute_tau_from_data(model, datamodule, args.device, csv_dir)
+        dri = model.loss_fn.dri
+        dri.precomputed_tau_v = torch.tensor(tau_v)
+        dri.precomputed_tau_l = torch.tensor(tau_l)
+        args.precomputed_tau_v = tau_v
+        args.precomputed_tau_l = tau_l
+
     if args.is_val:    
         # model params saving using Pytorch Lightning
         # we save the best 3 models accoring to Recall@1 on pittsburg val
@@ -167,9 +259,20 @@ if __name__ == '__main__':
             mode='max',)
 
     #------------------
+    # wandb logger (optional)
+    wandb_logger = None
+    if args.wandb_project:
+        import wandb
+        wandb.login(key="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")
+        wandb_logger = WandbLogger(
+            project=args.wandb_project,
+            config=vars(args),
+        )
+
     # we instanciate a trainer
     trainer = pl.Trainer(
-        accelerator='gpu', devices=[0],
+        accelerator='gpu' if 'cuda' in args.device else args.device,
+        devices=[0] if 'cuda' in args.device else 'auto',
         default_root_dir=f'./LOGS/{"resnet50"}', # Tensorflow can be used to viz
 
         num_sanity_val_steps=0, # runs a validation step before stating training
@@ -179,6 +282,7 @@ if __name__ == '__main__':
         callbacks=[checkpoint_cb],# we only run the checkpointing callback (you can add more)
         reload_dataloaders_every_n_epochs=1, # we reload the dataset to shuffle the order
         log_every_n_steps=20,
+        logger=wandb_logger if wandb_logger else True,
         # fast_dev_run=True # uncomment or dev mode (only runs a one iteration train and validation, no checkpointing).
     )
     
